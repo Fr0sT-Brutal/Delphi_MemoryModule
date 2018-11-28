@@ -1,12 +1,3 @@
-// To compile under FPC, Delphi mode must be used
-// Also define CPUX64 for simplicity
-{$IFDEF FPC}
-  {$mode delphi}
-  {$IFDEF CPU64}
-    {$DEFINE CPUX64}
-  {$ENDIF}
-{$ENDIF}
-
 unit MemoryModule;
 
 { * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
@@ -48,28 +39,53 @@ unit MemoryModule;
   * NOTE
   *   This code is Delphi translation of original C code taken from https://github.com/fancycode/MemoryModule
   *     (commit dc173ca from Mar 1, 2015).
-  *   Resource loading and exe loading, custom functions, user data not implemented yet.
+  *   Resource loading and exe loading, custom functions not implemented yet.
   *   Tested under RAD Studio XE2 and XE6 32/64-bit, Lazarus 32-bit
   * }
 
 interface
 
+// To compile under FPC, Delphi mode must be used
+{$IFDEF FPC}
+  {$mode delphi}
+{$ENDIF}
+// For Delphi define CPU64 for x64 arch (FPC-style)
+{$IFDEF CPUX64}
+  {$DEFINE CPU64}
+{$ENDIF}
+
 uses
   Windows;
 
 type
-  TMemoryModule = Pointer;
+  HMEMORYMODULE = Pointer;
+  HMEMORYRSRC = Pointer;
+  HCUSTOMMODULE = Pointer;
+
+  TCustomAllocFunc = function(Address: Pointer; Size: SIZE_T; AllocationType: DWORD; Protect: DWORD; UserData: Pointer): Pointer;
+  TCustomFreeFunc = function(Address: Pointer; Size: SIZE_T; dwFreeType: DWORD; UserData: Pointer): BOOL;
+  TCustomLoadLibraryFunc = function(Filename: LPCSTR; UserData: Pointer): HCUSTOMMODULE;
+  TCustomGetProcAddressFunc = function(Module: HCUSTOMMODULE; Name: LPCSTR; UserData: Pointer): FARPROC;
+  TCustomFreeLibraryFunc = procedure(Module: HCUSTOMMODULE; UserData: Pointer);
 
   { ++++++++++++++++++++++++++++++++++++++++++++++++++
     ***  Memory DLL loading functions Declaration  ***
     -------------------------------------------------- }
 
 // return value is nil if function fails
-function MemoryLoadLibary(Data: Pointer): TMemoryModule; stdcall;
+function MemoryLoadLibary(Data: Pointer; Size: SIZE_T): HMEMORYMODULE;
 // return value is nil if function fails
-function MemoryGetProcAddress(Module: TMemoryModule; const Name: PAnsiChar): Pointer; stdcall;
-// free module
-procedure MemoryFreeLibrary(Module: TMemoryModule); stdcall;
+function MemoryLoadLibaryEx(Data: Pointer; Size: SIZE_T;
+                            AllocMemory: TCustomAllocFunc;
+                            FreeMemory: TCustomFreeFunc;
+                            LoadLibrary: TCustomLoadLibraryFunc;
+                            GetProcAddress: TCustomGetProcAddressFunc;
+                            FreeLibrary: TCustomFreeLibraryFunc;
+                            UserData: Pointer): HMEMORYMODULE;
+// return value is nil if function fails
+function MemoryGetProcAddress(Modul: HMEMORYMODULE; Name: LPCSTR): FARPROC;
+// free Module
+procedure MemoryFreeLibrary(Modul: HMEMORYMODULE);
 
 implementation
 
@@ -90,23 +106,23 @@ implementation
   // Types that are declared in Pascal-style (ex.: PImageOptionalHeader); redeclaring them in C-style
 
   {$IF NOT DECLARED(PIMAGE_DATA_DIRECTORY)}
-  type PIMAGE_DATA_DIRECTORY = ^IMAGE_DATA_DIRECTORY;
+  type PIMAGE_DATA_DIRECTORY = PImageDataDirectory;
   {$IFEND}
 
   {$IF NOT DECLARED(PIMAGE_SECTION_HEADER)}
-  type PIMAGE_SECTION_HEADER = ^IMAGE_SECTION_HEADER;
+  type PIMAGE_SECTION_HEADER = PImageSectionHeader;
   {$IFEND}
 
   {$IF NOT DECLARED(PIMAGE_EXPORT_DIRECTORY)}
-  type PIMAGE_EXPORT_DIRECTORY = ^IMAGE_EXPORT_DIRECTORY;
+  type PIMAGE_EXPORT_DIRECTORY = PImageExportDirectory;
   {$IFEND}
 
   {$IF NOT DECLARED(PIMAGE_DOS_HEADER)}
-  type PIMAGE_DOS_HEADER = ^IMAGE_DOS_HEADER;
+  type PIMAGE_DOS_HEADER = PImageDosHeader;
   {$IFEND}
 
   {$IF NOT DECLARED(PIMAGE_NT_HEADERS)}
-  type PIMAGE_NT_HEADERS = ^IMAGE_NT_HEADERS;
+  type PIMAGE_NT_HEADERS = PImageNtHeaders;
   {$IFEND}
 
   {$IF NOT DECLARED(PUINT_PTR)}
@@ -120,7 +136,7 @@ const
   IMAGE_REL_BASED_DIR64 = 10;
 
 // Things that are incorrectly defined at least up to XE6 (miss x64 mapping)
-{$IFDEF CPUX64}
+{$IFDEF CPU64}
 type
   PIMAGE_TLS_DIRECTORY = PIMAGE_TLS_DIRECTORY64;
 const
@@ -132,7 +148,7 @@ const
   ----------------------------------------------- }
 const
   IMAGE_SIZEOF_BASE_RELOCATION = SizeOf(IMAGE_BASE_RELOCATION);
-  {$IFDEF CPUX64}
+  {$IFDEF CPU64}
   HOST_MACHINE = IMAGE_FILE_MACHINE_AMD64;
   {$ELSE}
   HOST_MACHINE = IMAGE_FILE_MACHINE_I386;
@@ -142,54 +158,61 @@ type
 { +++++++++++++++++++++++++++++++++++++++++++++++
   ***  Internal MemoryModule Type Definition  ***
   ----------------------------------------------- }
-  TMemoryModuleRec = record
+  TExportNameEntry = record
+    Name: LPCSTR;
+    Idx: Word;
+  end;
+  PExportNameEntry = ^TExportNameEntry;
+
+  TDllEntryProc = function(hinstDLL: HINST; fdwReason: DWORD; lpReserved: Pointer): BOOL; stdcall;
+  TExeEntryProc = function: Integer; stdcall;
+
+  {$IFDEF CPU64}
+  PPOINTER_LIST = ^POINTER_LIST;
+  POINTER_LIST = record
+    Next: PPOINTER_LIST;
+    Address: Pointer;
+  end;
+  {$ENDIF}
+
+  MEMORYMODULEREC = record
     Headers: PIMAGE_NT_HEADERS;
     CodeBase: Pointer;
     Modules: array of HCUSTOMMODULE;
     NumModules: Integer;
     Initialized: Boolean;
+    IsDLL: Boolean;
     IsRelocated: Boolean;
+    Alloc: TCustomAllocFunc;
+    Free: TCustomFreeFunc;
+    LoadLibrary: TCustomLoadLibraryFunc;
+    GetProcAddress: TCustomGetProcAddressFunc;
+    FreeLibrary: TCustomFreeLibraryFunc;
+    NameExportsTable: PExportNameEntry;
+    UserData: Pointer;
+    ExeEntry: TExeEntryProc;
     PageSize: DWORD;
+    {$IFDEF CPU64}
+    BlockedMemory: PPOINTER_LIST;
+    {$ENDIF}
   end;
-  PMemoryModule = ^TMemoryModuleRec;
+  PMEMORYMODULE = ^MEMORYMODULEREC;
 
-  TDllEntryProc = function(hinstDLL: HINST; fdwReason: DWORD; lpReserved: Pointer): BOOL; stdcall;
-
-  TSectionFinalizeData = record
+  SECTIONFINALIZEDATA = record
     Address: Pointer;
     AlignedAddress: Pointer;
     Size: SIZE_T;
     Characteristics: DWORD;
     Last: Boolean;
   end;
+  PSECTIONFINALIZEDATA = ^SECTIONFINALIZEDATA;
 
 // Explicitly export these functions to allow hooking of their origins
+{}{
 function GetProcAddress_Internal(hModule: HMODULE; lpProcName: LPCSTR): FARPROC; stdcall; external kernel32 name 'GetProcAddress';
 function LoadLibraryA_Internal(lpLibFileName: LPCSTR): HMODULE; stdcall; external kernel32 name 'LoadLibraryA';
 function FreeLibrary_Internal(hLibModule: HMODULE): BOOL; stdcall; external kernel32 name 'FreeLibrary';
-
-// Just an imitation to allow using try-except block. DO NOT try to handle this
-// like "on E do ..." !
-procedure Abort;
-begin
-  raise TObject.Create;
-end;
-
-// Copy from SysUtils to get rid of this unit
-function StrComp(const Str1, Str2: PAnsiChar): Integer;
-var
-  P1, P2: PAnsiChar;
-begin
-  P1 := Str1;
-  P2 := Str2;
-  while True do
-  begin
-    if (P1^ <> P2^) or (P1^ = #0) then
-      Exit(Ord(P1^) - Ord(P2^));
-    Inc(P1);
-    Inc(P2);
-  end;
-end;
+   }
 
   { +++++++++++++++++++++++++++++++++++++++++++++++++++++
     ***                Missing WinAPI macros          ***
@@ -214,24 +237,128 @@ end;
 {$IFEND}
 
   { +++++++++++++++++++++++++++++++++++++++++++++++++++++
+    ***               Local SysUtils copy             ***
+    ----------------------------------------------------- }
+
+type TSysCharSet = set of AnsiChar;
+  
+function StrComp(const Str1, Str2: PAnsiChar): Integer;
+var
+  P1, P2: PAnsiChar;
+begin
+  P1 := Str1;
+  P2 := Str2;
+  while True do
+  begin
+    if (P1^ <> P2^) or (P1^ = #0) then
+      Exit(Ord(P1^) - Ord(P2^));
+    Inc(P1);
+    Inc(P2);
+  end;
+end;
+
+function CharInSet(C: WideChar; const CharSet: TSysCharSet): Boolean;
+begin
+  Result := (Ord(C) < $7F) and (AnsiChar(C) in CharSet);
+end;
+
+function SysErrorMessage(ErrorCode: Cardinal): string;
+var
+  Buffer: PChar;
+  Len: Integer;
+begin
+  { Obtain the formatted message for the given Win32 ErrorCode
+    Let the OS initialize the Buffer variable. Need to LocalFree it afterward.
+  }
+  Len := FormatMessage(
+    FORMAT_MESSAGE_FROM_SYSTEM or
+    FORMAT_MESSAGE_IGNORE_INSERTS or
+    FORMAT_MESSAGE_ARGUMENT_ARRAY or
+    FORMAT_MESSAGE_ALLOCATE_BUFFER, nil, ErrorCode, 0, @Buffer, 0, nil);
+
+  try
+    { Remove the undesired line breaks and '.' char }
+    while (Len > 0) and (CharInSet(Buffer[Len - 1], [#0..#32, '.'])) do Dec(Len);
+    { Convert to Delphi string }
+    SetString(Result, Buffer, Len);
+  finally
+    { Free the OS allocated memory block }
+    LocalFree(HLOCAL(Buffer));
+  end;
+end;
+
+  { +++++++++++++++++++++++++++++++++++++++++++++++++++++
     ***                 Helper functions              ***
     ----------------------------------------------------- }
 
-function GET_HEADER_DICTIONARY(Module: PMemoryModule; Idx: Integer): PIMAGE_DATA_DIRECTORY;
+procedure UNREFERENCED_PARAMETER(var X);
+begin
+end;                   
+
+function GET_HEADER_DICTIONARY(Module: PMemoryModule; Idx: Integer): PIMAGE_DATA_DIRECTORY; inline;
 begin
   Result := PIMAGE_DATA_DIRECTORY(@(Module.Headers.OptionalHeader.DataDirectory[Idx]));
 end;
 
-function AlignValueDown(Address: Pointer; Alignment: DWORD): Pointer;
+function AlignValueDown(Address: UINT_PTR; Alignment: UINT_PTR): UINT_PTR; inline;
 begin
-  Result := Pointer(UIntPtr(Address) and not (Alignment - 1));
+  Result := Address and not (Alignment - 1);
 end;
 
-function CopySections(data: Pointer; old_headers: PIMAGE_NT_HEADERS; module: PMemoryModule): Boolean;
+function AlignAddressDown(Address: Pointer; Alignment: UINT_PTR): Pointer; inline;
+begin
+  Result := Pointer(AlignValueDown(UINT_PTR(Address), Alignment));
+end;
+
+function AlignValueUp(Value: SIZE_T; Alignment: SIZE_T): SIZE_T; inline;
+begin
+  Result := (Value + Alignment - 1) and not (Alignment - 1);
+end;
+
+function OffsetPointer(Data: Pointer; Offset: UINT_PTR): Pointer; inline;
+begin
+  Result := Pointer(UINT_PTR(Data) + Offset);
+end;
+
+procedure OutputLastError(const Msg: string);
+begin
+  {$IFNDEF DEBUG}
+    UNREFERENCED_PARAMETER(Msg);
+  {$ELSE}  
+    OutputDebugString(PChar(SysErrorMessage(GetLastError)));
+  {$ENDIF}
+end;
+
+{$IFDEF CPU64}
+procedure FreePointerList(Head: PPOINTER_LIST; FreeMemory: TCustomFreeFunc; UserData: Pointer);
+var Node, Next: PPOINTER_LIST;
+begin
+  Node := Head;
+  while Node <> nil do
+  begin
+    FreeMemory(Head.Address, 0, MEM_RELEASE, UserData);
+    Next := Node.Next;
+    Dispose(Node);
+    Node := Next;
+  end;
+end;
+{$ENDIF}
+
+function CheckSize(Size: SIZE_T; Expected: SIZE_T): Boolean;
+begin
+  if Size < Expected then
+  begin
+    SetLastError(ERROR_INVALID_DATA);
+    Exit(False);
+  end;
+  Exit(True);
+end;
+
+function CopySections(Data: Pointer; Size: SIZE_T; Old_headers: PIMAGE_NT_HEADERS; Module: PMEMORYMODULE): Boolean;
 var
-  i, Size: Integer;
+  i, Section_Size: Integer;
   CodeBase: Pointer;
-  dest: Pointer;
+  Dest: Pointer;
   Section: PIMAGE_SECTION_HEADER;
 begin
   CodeBase := Module.CodeBase;
@@ -242,39 +369,48 @@ begin
     // uninitialized Data
     if Section.SizeOfRawData = 0 then
     begin
-      Size := Old_headers.OptionalHeader.SectionAlignment;
-      if Size > 0 then
+      Section_Size := Old_headers.OptionalHeader.SectionAlignment;
+      if Section_Size > 0 then
       begin
-        dest := VirtualAlloc(PByte(CodeBase) + Section.VirtualAddress,
-                             Size,
-                             MEM_COMMIT,
-                             PAGE_READWRITE);
-        if dest = nil then
+        Dest := Module.Alloc(PByte(CodeBase) + Section.VirtualAddress,
+          Section_Size,
+          MEM_COMMIT,
+          PAGE_READWRITE,
+          Module.UserData);
+        if Dest = nil then
           Exit(False);
         // Always use position from file to support alignments smaller
-        // than page Size.
-        dest := PByte(CodeBase) + Section.VirtualAddress;
-        Section.Misc.PhysicalAddress := DWORD(dest);
-        ZeroMemory(dest, Size);
+        // than page size.
+        Dest := PByte(CodeBase) + Section.VirtualAddress;
+        // NOTE: On 64bit systems we truncate to 32bit here but expand
+        // again later when "PhysicalAddress" is used.
+        Section.Misc.PhysicalAddress := DWORD(UINT_PTR(Dest) and $ffffffff);
+        ZeroMemory(Dest, Section_Size);
       end;
       // Section is empty
       Inc(Section);
       Continue;
     end; // if
 
+    if not CheckSize(Size, UINT_PTR(Section.PointerToRawData) + Section.SizeOfRawData) then
+      Exit(False);
+
     // commit memory block and copy Data from dll
-    dest := VirtualAlloc(PByte(CodeBase) + Section.VirtualAddress,
-                         Section.SizeOfRawData,
-                         MEM_COMMIT,
-                         PAGE_READWRITE);
-    if dest = nil then
+    Dest := Module.Alloc(PByte(CodeBase) + Section.VirtualAddress,
+      Section.SizeOfRawData,
+      MEM_COMMIT,
+      PAGE_READWRITE,
+      Module.UserData);
+    if Dest = nil then
       Exit(False);
 
     // Always use position from file to support alignments smaller
-    // than page Size.
-    dest := PByte(CodeBase) + Section.VirtualAddress;
-    CopyMemory(dest, PByte(Data) + Section.PointerToRawData, Section.SizeOfRawData);
-    Section.Misc.PhysicalAddress := DWORD(dest);
+    // than page size (allocation above will align to page size).
+    Dest := PByte(CodeBase) + Section.VirtualAddress;
+    CopyMemory(Dest, PByte(Data) + Section.PointerToRawData, Section.SizeOfRawData);
+    // NOTE: On 64bit systems we truncate to 32bit here but expand
+    // again later when "PhysicalAddress" is used.
+    Section.Misc.PhysicalAddress := DWORD(UINT_PTR(Dest) and $ffffffff);
     Inc(Section);
   end; // for
 
@@ -297,20 +433,22 @@ const
     )
 );
 
-function GetRealSectionSize(Module: PMemoryModule; Section: PIMAGE_SECTION_HEADER): DWORD;
+function GetRealSectionSize(Module: PMEMORYMODULE; Section: PIMAGE_SECTION_HEADER): SIZE_T;
+var Size: DWORD;
 begin
-  Result := Section.SizeOfRawData;
-  if Result = 0 then
+  Size := Section.SizeOfRawData;
+  if Size = 0 then
     if (Section.Characteristics and IMAGE_SCN_CNT_INITIALIZED_DATA) <> 0 then
-      Result := Module.Headers.OptionalHeader.SizeOfInitializedData
+      Size := Module.Headers.OptionalHeader.SizeOfInitializedData
     else if (Section.Characteristics and IMAGE_SCN_CNT_UNINITIALIZED_DATA) <> 0 then
-      Result := Module.Headers.OptionalHeader.SizeOfUninitializedData;
+      Size := Module.Headers.OptionalHeader.SizeOfUninitializedData;
+  Result := SIZE_T(Size);
 end;
 
-function FinalizeSection(Module: PMemoryModule; const SectionData: TSectionFinalizeData): Boolean;
+function FinalizeSection(Module: PMEMORYMODULE; const SectionData: SECTIONFINALIZEDATA): Boolean;
 var
-  protect, oldProtect: DWORD;
-  executable, readable, writeable: Boolean;
+  Protect, OldProtect: DWORD;
+  Executable, Readable, Writeable: Boolean;
 begin
   if SectionData.Size = 0 then
     Exit(True);
@@ -324,57 +462,60 @@ begin
          (SectionData.Size mod Module.PageSize = 0)
        ) then
          // Only allowed to decommit whole pages
-         VirtualFree(SectionData.Address, SectionData.Size, MEM_DECOMMIT);
+         Module.Free(SectionData.Address, SectionData.Size, MEM_DECOMMIT, Module.UserData);
     Exit(True);
   end;
 
   // determine protection flags based on Characteristics
-  executable := (SectionData.Characteristics and IMAGE_SCN_MEM_EXECUTE) <> 0;
-  readable   := (SectionData.Characteristics and IMAGE_SCN_MEM_READ) <> 0;
-  writeable  := (SectionData.Characteristics and IMAGE_SCN_MEM_WRITE) <> 0;
-  protect := ProtectionFlags[executable][readable][writeable];
+  Executable := (SectionData.Characteristics and IMAGE_SCN_MEM_EXECUTE) <> 0;
+  Readable   := (SectionData.Characteristics and IMAGE_SCN_MEM_READ) <> 0;
+  Writeable  := (SectionData.Characteristics and IMAGE_SCN_MEM_WRITE) <> 0;
+  Protect := ProtectionFlags[Executable][Readable][Writeable];
   if (SectionData.Characteristics and IMAGE_SCN_MEM_NOT_CACHED) <> 0 then
-    protect := protect or PAGE_NOCACHE;
+    Protect := Protect or PAGE_NOCACHE;
 
   // change memory access flags
-  Result := VirtualProtect(SectionData.Address, SectionData.Size, protect, oldProtect);
+  Result := VirtualProtect(SectionData.Address, SectionData.Size, Protect, OldProtect);
+  if not Result then
+    OutputLastError('Error protecting memory page');
 end;
 
-function FinalizeSections(Module: PMemoryModule): Boolean;
+function FinalizeSections(Module: PMEMORYMODULE): Boolean;
 var
   i: Integer;
   Section: PIMAGE_SECTION_HEADER;
-  imageOffset: UIntPtr;
-  SectionData: TSectionFinalizeData;
-  sectionAddress, AlignedAddress: Pointer;
-  sectionSize: DWORD;
+  ImageOffset: UIntPtr;
+  SectionData: SECTIONFINALIZEDATA;
+  SectionAddress, AlignedAddress: Pointer;
+  SectionSize: DWORD;
 begin
   Section := PIMAGE_SECTION_HEADER(IMAGE_FIRST_SECTION(Module.Headers{$IFNDEF FPC}^{$ENDIF}));
-  {$IFDEF CPUX64}
-  imageOffset := (NativeUInt(Module.CodeBase) and $ffffffff00000000);
+  {$IFDEF CPU64}
+  // "PhysicalAddress" might have been truncated to 32bit above, expand to
+  // 64bits again.
+  ImageOffset := UIntPtr(Module.Headers.OptionalHeader.ImageBase) and $ffffffff00000000;
   {$ELSE}
-  imageOffset := 0;
+  ImageOffset := 0;
   {$ENDIF}
 
-  SectionData.Address := Pointer(UIntPtr(Section.Misc.PhysicalAddress) or imageOffset);
-  SectionData.AlignedAddress := ALIGN_DOWN(SectionData.Address, Module.PageSize);
+  SectionData.Address := Pointer(UIntPtr(Section.Misc.PhysicalAddress) or ImageOffset);
+  SectionData.AlignedAddress := AlignAddressDown(SectionData.Address, Module.PageSize);
   SectionData.Size := GetRealSectionSize(Module, Section);
   SectionData.Characteristics := Section.Characteristics;
   SectionData.Last := False;
   Inc(Section);
 
   // loop through all sections and change access flags
-
   for i := 1 to Module.Headers.FileHeader.NumberOfSections - 1 do
   begin
-    sectionAddress := Pointer(UIntPtr(Section.Misc.PhysicalAddress) or imageOffset);
-    AlignedAddress := ALIGN_DOWN(SectionData.Address, Module.PageSize);
-    sectionSize := GetRealSectionSize(Module, Section);
+    SectionAddress := Pointer(UIntPtr(Section.Misc.PhysicalAddress) or ImageOffset);
+    AlignedAddress := AlignAddressDown(SectionData.Address, Module.PageSize);
+    SectionSize := GetRealSectionSize(Module, Section);
     // Combine access flags of all sections that share a page
-    // TODO(fancycode): We currently share flags of a trailing large Section
-    //   with the page of a first small Section. This should be optimized.
+    // TODO(fancycode): We currently share flags of a trailing large section
+    //   with the page of a first small section. This should be optimized.
     if (SectionData.AlignedAddress = AlignedAddress) or
-       (PByte(SectionData.Address) + SectionData.Size > PByte(AlignedAddress)) then
+       (UIntPtr(SectionData.Address) + SectionData.Size > UIntPtr(AlignedAddress)) then
     begin
       // Section shares page with previous
       if (Section.Characteristics and IMAGE_SCN_MEM_DISCARDABLE = 0) or
@@ -382,7 +523,7 @@ begin
         SectionData.Characteristics := (SectionData.Characteristics or Section.Characteristics) and not IMAGE_SCN_MEM_DISCARDABLE
       else
         SectionData.Characteristics := SectionData.Characteristics or Section.Characteristics;
-      SectionData.Size := PByte(sectionAddress) + sectionSize - PByte(SectionData.Address);
+      SectionData.Size := UIntPtr(SectionAddress) + UIntPtr(SectionSize) - UIntPtr(SectionData.Address);
       Inc(Section);
       Continue;
     end;
@@ -390,9 +531,9 @@ begin
     if not FinalizeSection(Module, SectionData) then
       Exit(False);
 
-    SectionData.Address := sectionAddress;
+    SectionData.Address := SectionAddress;
     SectionData.AlignedAddress := AlignedAddress;
-    SectionData.Size := sectionSize;
+    SectionData.Size := SectionSize;
     SectionData.Characteristics := Section.Characteristics;
 
     Inc(Section);
@@ -405,130 +546,130 @@ begin
   Result := True;
 end;
 
-function ExecuteTLS(Module: PMemoryModule): Boolean;
+function ExecuteTLS(Module: PMEMORYMODULE): Boolean;
 var
   CodeBase: Pointer;
-  directory: PIMAGE_DATA_DIRECTORY;
-  tls: PIMAGE_TLS_DIRECTORY;
-  callback: PPointer; // =^PIMAGE_TLS_CALLBACK;
+  Tls: PIMAGE_TLS_DIRECTORY;
+  Callback: PPointer; // =^PIMAGE_TLS_CALLBACK; see note below
+  Directory: PIMAGE_DATA_DIRECTORY;
 
-  // TLS callback pointers are VA's (ImageBase included) so if the module resides at
+  // Tls Callback pointers are VA's (ImageBase included) so if the module resides at
   // the other ImageBage they become invalid. This routine relocates them to the
   // actual ImageBase.
-  // The case seem to happen with DLLs only and they rarely use TLS callbacks.
+  // The case seem to happen with DLLs only and they rarely use Tls callbacks.
   // Moreover, they probably don't work at all when using DLL dynamically which is
   // the case in our code.
-  function FixPtr(OldPtr: Pointer): Pointer;
+  {}function FixPtr(OldPtr: Pointer): Pointer;
   begin
-    Result := Pointer(NativeInt(OldPtr) - Module.Headers.OptionalHeader.ImageBase + NativeInt(CodeBase));
+    Result := OldPtr;  //Pointer(NativeInt(OldPtr) - Module.Headers.OptionalHeader.ImageBase + NativeInt(CodeBase));
   end;
 
 begin
   Result := True;
   CodeBase := Module.CodeBase;
 
-  directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_TLS);
-  if directory.VirtualAddress = 0 then
+  Directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_TLS);
+  if Directory.VirtualAddress = 0 then
     Exit;
 
-  tls := PIMAGE_TLS_DIRECTORY(PByte(CodeBase) + directory.VirtualAddress);
+  Tls := PIMAGE_TLS_DIRECTORY(PByte(CodeBase) + Directory.VirtualAddress);
   // Delphi syntax is quite awkward when dealing with proc pointers so we have to
   // use casts to untyped pointers
-  callback := Pointer(tls.AddressOfCallBacks);
-  if callback <> nil then
+  Callback := Pointer(Tls.AddressOfCallBacks);
+  if Callback <> nil then
   begin
-    callback := FixPtr(callback);
-    while callback^ <> nil do
+    Callback := FixPtr(Callback);
+    while Callback^ <> nil do
     begin
-      PIMAGE_TLS_CALLBACK(FixPtr(callback^))(CodeBase, DLL_PROCESS_ATTACH, nil);
-      Inc(callback);
+      PIMAGE_TLS_CALLBACK(FixPtr(Callback^))(CodeBase, DLL_PROCESS_ATTACH, nil);
+      Inc(Callback);
     end;
   end;
 end;
 
-function PerformBaseRelocation(Module: PMemoryModule; Delta: NativeInt): Boolean;
+function PerformBaseRelocation(Module: PMEMORYMODULE; Delta: NativeInt): Boolean;
 var
-  i: Cardinal;
+  i: DWORD;
   CodeBase: Pointer;
-  directory: PIMAGE_DATA_DIRECTORY;
-  relocation: PIMAGE_BASE_RELOCATION;
-  dest: Pointer;
-  relInfo: ^UInt16;
-  patchAddrHL: PDWORD;
-  {$IFDEF CPUX64}
-  patchAddr64: PULONGLONG;
+  Directory: PIMAGE_DATA_DIRECTORY;
+  Relocation: PIMAGE_BASE_RELOCATION;
+  Dest: Pointer;
+  RelInfo: ^USHORT;
+  PatchAddrHL: PDWORD;
+  {$IFDEF CPU64}
+  PatchAddr64: PULONGLONG;
   {$ENDIF}
-  relType, offset: Integer;
+  RelType, Offset: Integer;
 begin
   CodeBase := Module.CodeBase;
-  directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-  if directory.Size = 0 then
+  Directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+  if Directory.Size = 0 then
     Exit(Delta = 0);
 
-  relocation := PIMAGE_BASE_RELOCATION(PByte(CodeBase) + directory.VirtualAddress);
-  while relocation.VirtualAddress > 0 do
+  Relocation := PIMAGE_BASE_RELOCATION(PByte(CodeBase) + Directory.VirtualAddress);
+  while Relocation.VirtualAddress > 0 do
   begin
-    dest := Pointer(PByte(CodeBase) + relocation.VirtualAddress);
-    relInfo := Pointer(PByte(relocation) + IMAGE_SIZEOF_BASE_RELOCATION);
-    for i := 0 to Trunc(((relocation.SizeOfBlock - IMAGE_SIZEOF_BASE_RELOCATION) / 2)) - 1 do
+    Dest := PByte(CodeBase) + Relocation.VirtualAddress;
+    RelInfo := OffsetPointer(Relocation, IMAGE_SIZEOF_BASE_RELOCATION);
+    for i := 0 to Trunc(((Relocation.SizeOfBlock - IMAGE_SIZEOF_BASE_RELOCATION) / 2)) - 1 do
     begin
-      // the upper 4 bits define the type of relocation
-      relType := relInfo^ shr 12;
-      // the lower 12 bits define the offset
-      offset := relInfo^ and $FFF;
+      // the upper 4 bits define the type of Relocation
+      RelType := RelInfo^ shr 12;
+      // the lower 12 bits define the Offset
+      Offset := RelInfo^ and $FFF;
 
-      case relType of
+      case RelType of
         IMAGE_REL_BASED_ABSOLUTE:
-          // skip relocation
+          // skip Relocation
           ;
         IMAGE_REL_BASED_HIGHLOW:
           begin
             // change complete 32 bit address
-            patchAddrHL := Pointer(PByte(dest) + offset);
-            Inc(patchAddrHL^, Delta);
+            PatchAddrHL := Pointer(PByte(Dest) + Offset);
+            Inc(PatchAddrHL^, Delta);
           end;
 
-        {$IFDEF CPUX64}
+        {$IFDEF CPU64}
         IMAGE_REL_BASED_DIR64:
           begin
-            patchAddr64 := Pointer(PByte(dest) + offset);
-            Inc(patchAddr64^, Delta);
+            PatchAddr64 := Pointer(PByte(Dest) + Offset);
+            Inc(PatchAddr64^, Delta);
           end;
         {$ENDIF}
       end;
 
-      Inc(relInfo);
+      Inc(RelInfo);
     end; // for
 
-    // advance to next relocation block
-    relocation := PIMAGE_BASE_RELOCATION(PByte(relocation) + relocation.SizeOfBlock);
+    // advance to next Relocation block
+    Relocation := PIMAGE_BASE_RELOCATION(OffsetPointer(Relocation, Relocation.SizeOfBlock));
   end; // while
 
   Result := True;
 end;
 
-function BuildImportTable(Module: PMemoryModule): Boolean; stdcall;
+function BuildImportTable(Module: PMEMORYMODULE): Boolean; 
 var
   CodeBase: Pointer;
-  directory: PIMAGE_DATA_DIRECTORY;
-  importDesc: PIMAGE_IMPORT_DESCRIPTOR;
-  thunkRef: PUINT_PTR;
-  funcRef: ^FARPROC;
-  handle: HMODULE;
-  thunkData: PIMAGE_IMPORT_BY_NAME;
+  Directory: PIMAGE_DATA_DIRECTORY;
+  ImportDesc: PIMAGE_IMPORT_DESCRIPTOR;
+  ThunkRef: PUINT_PTR;
+  FuncRef: ^FARPROC;
+  Handle: HCUSTOMMODULE;
+  ThunkData: PIMAGE_IMPORT_BY_NAME;
 begin
   CodeBase := Module.CodeBase;
   Result := True;
 
-  directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_IMPORT);
-  if directory.Size = 0 then
-    Exit(True);
+  Directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_IMPORT);
+  if Directory.Size = 0 then
+    Exit;
 
-  importDesc := PIMAGE_IMPORT_DESCRIPTOR(PByte(CodeBase) + directory.VirtualAddress);
-  while (not IsBadReadPtr(importDesc, SizeOf(IMAGE_IMPORT_DESCRIPTOR))) and (importDesc.Name <> 0) do
+  ImportDesc := PIMAGE_IMPORT_DESCRIPTOR(PByte(CodeBase) + Directory.VirtualAddress);
+  while (not IsBadReadPtr(ImportDesc, SizeOf(IMAGE_IMPORT_DESCRIPTOR))) and (ImportDesc.Name <> 0) do
   begin
-    handle := LoadLibraryA_Internal(PAnsiChar(PByte(CodeBase) + importDesc.Name));
-    if handle = 0 then
+    Handle := Module.LoadLibrary(PAnsiChar(PByte(CodeBase) + ImportDesc.Name), Module.UserData);
+    if Handle = nil then
     begin
       SetLastError(ERROR_MOD_NOT_FOUND);
       Result := False;
@@ -538,158 +679,295 @@ begin
     try
       SetLength(Module.Modules, Module.NumModules + 1);
     except
-      FreeLibrary_Internal(handle);
+      Module.FreeLibrary(Handle, Module.UserData);
       SetLastError(ERROR_OUTOFMEMORY);
       Result := False;
       Break;
     end;
-    Module.Modules[Module.NumModules] := handle;
+    Module.Modules[Module.NumModules] := Handle;
     Inc(Module.NumModules);
 
-    if importDesc.OriginalFirstThunk <> 0 then
+    if ImportDesc.OriginalFirstThunk <> 0 then
     begin
-      thunkRef := Pointer(PByte(CodeBase) + importDesc.OriginalFirstThunk);
-      funcRef := Pointer(PByte(CodeBase) + importDesc.FirstThunk);
+      ThunkRef := Pointer(PByte(CodeBase) + ImportDesc.OriginalFirstThunk);
+      FuncRef := Pointer(PByte(CodeBase) + ImportDesc.FirstThunk);
     end
     else
     begin
       // no hint table
-      thunkRef := Pointer(PByte(CodeBase) + importDesc.FirstThunk);
-      funcRef := Pointer(PByte(CodeBase) + importDesc.FirstThunk);
+      ThunkRef := Pointer(PByte(CodeBase) + ImportDesc.FirstThunk);
+      FuncRef := Pointer(PByte(CodeBase) + ImportDesc.FirstThunk);
     end;
 
-    while thunkRef^ <> 0 do
+    while ThunkRef^ <> 0 do
     begin
-      if IMAGE_SNAP_BY_ORDINAL(thunkRef^) then
-        funcRef^ := GetProcAddress_Internal(handle, PAnsiChar(IMAGE_ORDINAL(thunkRef^)))
+      if IMAGE_SNAP_BY_ORDINAL(ThunkRef^) then
+        FuncRef^ := Module.GetProcAddress(Handle, LPCSTR(IMAGE_ORDINAL(ThunkRef^)), Module.UserData)
       else
       begin
-        thunkData := PIMAGE_IMPORT_BY_NAME(PByte(CodeBase) + thunkRef^);
-        funcRef^ := GetProcAddress_Internal(handle, PAnsiChar(@(thunkData.Name)));
+        ThunkData := PIMAGE_IMPORT_BY_NAME(PByte(CodeBase) + ThunkRef^);
+        FuncRef^ := Module.GetProcAddress(Handle, LPCSTR(@(ThunkData.Name)), Module.UserData);
       end;
-      if funcRef^ = nil then
+      if FuncRef^ = nil then
       begin
         Result := False;
         Break;
       end;
-      Inc(funcRef);
-      Inc(thunkRef);
+      Inc(FuncRef);
+      Inc(ThunkRef);
     end; // while
 
     if not Result then
     begin
-      FreeLibrary_Internal(handle);
+      Module.FreeLibrary(Handle, Module.UserData);
       SetLastError(ERROR_PROC_NOT_FOUND);
       Break;
     end;
 
-    Inc(importDesc);
+    Inc(ImportDesc);
   end; // while
+end;
+
+function MemoryDefaultAlloc(Address: Pointer; Size: SIZE_T; AllocationType: DWORD; Protect: DWORD; UserData: Pointer): Pointer;
+begin
+	UNREFERENCED_PARAMETER(UserData);
+	Result := VirtualAlloc(Address, Size, AllocationType, Protect);
+end;
+
+function MemoryDefaultFree(Address: Pointer; Size: SIZE_T; dwFreeType: DWORD; UserData: Pointer): BOOL;
+begin
+	UNREFERENCED_PARAMETER(UserData);
+	Result := VirtualFree(Address, Size, dwFreeType);
+end;
+
+function MemoryDefaultLoadLibrary(Filename: LPCSTR; UserData: Pointer): HCUSTOMMODULE;
+begin
+	UNREFERENCED_PARAMETER(UserData);
+  Result := HCUSTOMMODULE(LoadLibraryA(Filename));
+end;
+
+function MemoryDefaultGetProcAddress(Module: HCUSTOMMODULE; Name: LPCSTR; UserData: Pointer): FARPROC;
+begin
+	UNREFERENCED_PARAMETER(UserData);
+  Result := GetProcAddress(HMODULE(Module), Name);
+end;
+
+procedure MemoryDefaultFreeLibrary(Module: HCUSTOMMODULE; UserData: Pointer);
+begin
+  UNREFERENCED_PARAMETER(UserData);
+  FreeLibrary(HMODULE(Module));
 end;
 
   { +++++++++++++++++++++++++++++++++++++++++++++++++++++
     ***  Memory DLL loading functions Implementation  ***
     ----------------------------------------------------- }
 
-function MemoryLoadLibary(Data: Pointer): TMemoryModule; stdcall;
-var
-  dos_header: PIMAGE_DOS_HEADER;
-  old_header: PIMAGE_NT_HEADERS;
-  code, Headers: Pointer;
-  locationdelta: NativeInt;
-  sysInfo: SYSTEM_INFO;
-  DllEntry: TDllEntryProc;
-  successfull: Boolean;
-  Module: PMemoryModule;
+function MemoryLoadLibary(Data: Pointer; Size: SIZE_T): HMEMORYMODULE;
 begin
-  Result := nil; Module := nil;
+  Result := MemoryLoadLibaryEx(Data, Size, MemoryDefaultAlloc, MemoryDefaultFree,
+    MemoryDefaultLoadLibrary, MemoryDefaultGetProcAddress, MemoryDefaultFreeLibrary, nil);
+end;
 
-  try
-    dos_header := PIMAGE_DOS_HEADER(Data);
-    if (dos_header.e_magic <> IMAGE_DOS_SIGNATURE) then
+function MemoryLoadLibaryEx(Data: Pointer; Size: SIZE_T;
+                            AllocMemory: TCustomAllocFunc;
+                            FreeMemory: TCustomFreeFunc;
+                            LoadLibrary: TCustomLoadLibraryFunc;
+                            GetProcAddress: TCustomGetProcAddressFunc;
+                            FreeLibrary: TCustomFreeLibraryFunc;
+                            UserData: Pointer): HMEMORYMODULE;
+
+  // Just an imitation to allow using try-except block without using SysUtils.
+  // DO NOT try to handle this like "on E do ..." !
+  procedure Abort;
+  begin
+    raise TObject.Create;
+  end;
+
+var
+  Dos_header: PIMAGE_DOS_HEADER;
+  Old_header: PIMAGE_NT_HEADERS;
+  Code, Headers: Pointer;
+  LocationDelta: NativeInt;
+  SysInfo: SYSTEM_INFO;
+  Section: PIMAGE_SECTION_HEADER;
+  i: DWORD;
+  OptionalSectionSize, LastSectionEnd, AlignedImageSize, EndOfSection: SIZE_T;
+  {$IFDEF CPU64}
+  BlockedMemory, Node: PPOINTER_LIST; 
+  {$ENDIF}
+  DllEntry: TDllEntryProc;
+  Successfull: Boolean;
+  Module: PMEMORYMODULE;
+begin
+  Result := nil; Module := nil; LastSectionEnd := 0; {$IFDEF CPU64} BlockedMemory := nil; {$ENDIF}
+
+  if not CheckSize(Size, SizeOf(IMAGE_DOS_HEADER)) then
+    Exit;
+
+  Dos_header := PIMAGE_DOS_HEADER(Data);
+  if (Dos_header.e_magic <> IMAGE_DOS_SIGNATURE) then
+  begin
+    SetLastError(ERROR_BAD_EXE_FORMAT);
+    Exit;
+  end;
+
+  if not CheckSize(Size, Dos_header.e_lfarlc + SizeOf(IMAGE_NT_HEADERS)) then
+    Exit;
+
+  // old_header = (PIMAGE_NT_HEADERS)&((const unsigned char *)(data))[dos_header->e_lfanew];
+  Old_header := PIMAGE_NT_HEADERS(PByte(Data) + Dos_header._lfanew);
+  if Old_header.Signature <> IMAGE_NT_SIGNATURE then
+  begin
+    SetLastError(ERROR_BAD_EXE_FORMAT);
+    Exit;
+  end;
+
+  if Old_header.FileHeader.Machine <> HOST_MACHINE then
+  begin
+    SetLastError(ERROR_BAD_EXE_FORMAT);
+    Exit;
+  end;
+
+  if (Old_header.OptionalHeader.SectionAlignment and 1) <> 0 then
+  begin
+    // Only support section alignments that are a multiple of 2
+    SetLastError(ERROR_BAD_EXE_FORMAT);
+    Exit;
+  end;
+
+  Section := IMAGE_FIRST_SECTION(Old_header^);
+  OptionalSectionSize := Old_header.OptionalHeader.SectionAlignment;
+  for i := 1 to Old_header.FileHeader.NumberOfSections do
+  begin
+    if Section.SizeOfRawData = 0 then
+      // Section without data in the DLL
+      EndOfSection := Section.VirtualAddress + OptionalSectionSize
+    else 
+      EndOfSection := Section.VirtualAddress + Section.SizeOfRawData;
+
+    if EndOfSection > LastSectionEnd then
+      LastSectionEnd := EndOfSection;
+
+    Inc(Section);
+  end;
+
+  GetNativeSystemInfo({$IFDEF FPC}@{$ENDIF}SysInfo);
+
+  AlignedImageSize := AlignValueUp(Old_header.OptionalHeader.SizeOfImage, SysInfo.dwPageSize);
+  if AlignedImageSize <> AlignValueUp(LastSectionEnd, SysInfo.dwPageSize) then
+  begin
+    SetLastError(ERROR_BAD_EXE_FORMAT);
+    Exit;
+  end;
+
+  // reserve memory for image of library
+  // XXX: is it correct to commit the complete memory region at once?
+  //      calling DllEntry raises an exception if we don't...
+  Code := AllocMemory(Pointer(Old_header.OptionalHeader.ImageBase),
+                      AlignedImageSize,
+                      MEM_RESERVE or MEM_COMMIT,
+                      PAGE_READWRITE,
+                      UserData);
+  if Code = nil then
+  begin
+    // try to allocate memory at arbitrary position
+    Code := AllocMemory(nil,
+                        AlignedImageSize,
+                        MEM_RESERVE or MEM_COMMIT,
+                        PAGE_READWRITE,
+                        UserData);
+    if Code = nil then
     begin
-      SetLastError(ERROR_BAD_EXE_FORMAT);
+      SetLastError(ERROR_OUTOFMEMORY);
       Exit;
     end;
+  end;
 
-    // old_header = (PIMAGE_NT_HEADERS)&((const unsigned char * )(Data))[dos_header->e_lfanew];
-    old_header := PIMAGE_NT_HEADERS(PByte(Data) + dos_header._lfanew);
-    if old_header.Signature <> IMAGE_NT_SIGNATURE then
+  {$IFDEF CPU64}
+  // Memory block may not span 4 GB boundaries.
+  while UINT_PTR(Code) shr 32 < UINT_PTR(PByte(Code) + AlignedImageSize) shr 32 do
+  begin
+    Node := AllocMem(SizeOf(POINTER_LIST));
+    if Node = nil then
     begin
-      SetLastError(ERROR_BAD_EXE_FORMAT);
-      Exit;
-    end;
-
-    {$IFDEF CPUX64}
-    if old_header.FileHeader.Machine <> IMAGE_FILE_MACHINE_AMD64 then
-    {$ELSE}
-    if old_header.FileHeader.Machine <> IMAGE_FILE_MACHINE_I386 then
-    {$ENDIF}
-    begin
-      SetLastError(ERROR_BAD_EXE_FORMAT);
-      Exit;
-    end;
-
-    if (old_header.OptionalHeader.SectionAlignment and 1) <> 0 then
-    begin
-      // Only support section alignments that are a multiple of 2
-      SetLastError(ERROR_BAD_EXE_FORMAT);
-      Exit;
-    end;
-
-    // reserve memory for image of library
-    // XXX: is it correct to commit the complete memory region at once?
-    //      calling DllEntry raises an exception if we don't...
-    code := VirtualAlloc(Pointer(old_header.OptionalHeader.ImageBase),
-                         old_header.OptionalHeader.SizeOfImage,
-                         MEM_RESERVE or MEM_COMMIT,
-                         PAGE_READWRITE);
-    if code = nil then
-    begin
-      // try to allocate memory at arbitrary position
-      code := VirtualAlloc(nil,
-                           old_header.OptionalHeader.SizeOfImage,
-                           MEM_RESERVE or MEM_COMMIT,
-                           PAGE_READWRITE);
-      if code = nil then
-      begin
-        SetLastError(ERROR_OUTOFMEMORY);
-        Exit;
-      end;
-    end;
-
-    Module := PMemoryModule(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, SizeOf(TMemoryModuleRec)));
-    if Module = nil then
-    begin
-      VirtualFree(code, 0, MEM_RELEASE);
+      FreeMemory(Code, 0, MEM_RELEASE, UserData);
+      FreePointerList(BlockedMemory, FreeMemory, UserData);
       SetLastError(ERROR_OUTOFMEMORY);
       Exit;
     end;
 
+    Node.Next := BlockedMemory;
+    Node.Address := Code;
+    BlockedMemory := Node;
+
+    Code := AllocMemory(nil,
+      AlignedImageSize,
+      MEM_RESERVE or MEM_COMMIT,
+      PAGE_READWRITE,
+      UserData);
+
+    if Code = nil then
+    begin
+      FreePointerList(BlockedMemory, FreeMemory, UserData);
+      SetLastError(ERROR_OUTOFMEMORY);
+      Exit;
+    end;
+
+  end; // while
+  {$ENDIF}
+
+  Module := PMEMORYMODULE(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, SizeOf(MEMORYMODULEREC)));
+  if Module = nil then
+  begin
+    FreeMemory(Code, 0, MEM_RELEASE, UserData);
+    {$IFDEF CPU64}
+    FreePointerList(BlockedMemory, FreeMemory, UserData);
+    {$ENDIF}
+    SetLastError(ERROR_OUTOFMEMORY);
+    Exit;
+  end;
+
+  try
     // memory is zeroed by HeapAlloc
-    Module.CodeBase := code;
-    GetNativeSystemInfo({$IFDEF FPC}@{$ENDIF}sysInfo);
-    Module.PageSize := sysInfo.dwPageSize;
+    Module.CodeBase := Code;
+    Module.IsDLL := (Old_header.FileHeader.Characteristics and IMAGE_FILE_DLL) <> 0;
+    Module.Alloc := AllocMemory;
+    Module.Free := FreeMemory;
+    Module.LoadLibrary := LoadLibrary;
+    Module.GetProcAddress := GetProcAddress;
+    Module.FreeLibrary := FreeLibrary;
+    Module.UserData := UserData;
+    Module.PageSize := SysInfo.dwPageSize;
+    {$IFDEF CPU64}
+    Module.BlockedMemory := BlockedMemory;
+    {$ENDIF}
 
+    if not CheckSize(Size, Old_header.OptionalHeader.SizeOfHeaders) then
+      Abort;
+    
     // commit memory for Headers
-    Headers := VirtualAlloc(code,
-                            old_header.OptionalHeader.SizeOfHeaders,
-                            MEM_COMMIT,
-                            PAGE_READWRITE);
+    Headers := AllocMemory(Code,
+                           Old_header.OptionalHeader.SizeOfHeaders,
+                           MEM_COMMIT,
+                           PAGE_READWRITE,
+                           UserData);
 
-    // copy PE header to code
-    CopyMemory(Headers, dos_header, old_header.OptionalHeader.SizeOfHeaders);
-    // result->Headers = (PIMAGE_NT_HEADERS)&((const unsigned char *)(Headers))[dos_header->e_lfanew];
-    Module.Headers := PIMAGE_NT_HEADERS(PByte(Headers) + dos_header._lfanew);
+    // copy PE header to Code
+    CopyMemory(Headers, Dos_header, Old_header.OptionalHeader.SizeOfHeaders);
+    // result->Headers = (PIMAGE_NT_HEADERS)&((const unsigned char * )(Headers))[Dos_header->e_lfanew];
+    Module.Headers := PIMAGE_NT_HEADERS(PByte(Headers) + Dos_header._lfanew);
+
+    // update position
+    Module.Headers.OptionalHeader.ImageBase := UINT_PTR(Code);
 
     // copy sections from DLL file block to new memory location
-    if not CopySections(Data, old_header, Module) then
+    if not CopySections(Data, Size, Old_header, Module) then
       Abort;
 
     // adjust base address of imported data
-    locationdelta := NativeInt(code) - old_header.OptionalHeader.ImageBase;
-    if locationdelta <> 0 then
-      Module.IsRelocated := PerformBaseRelocation(Module, locationdelta)
+    LocationDelta := PByte(Module.Headers.OptionalHeader.ImageBase) - PByte(Old_header.OptionalHeader.ImageBase);
+    if LocationDelta <> 0 then
+      Module.IsRelocated := PerformBaseRelocation(Module, LocationDelta)
     else
       Module.IsRelocated := True;
 
@@ -708,17 +986,22 @@ begin
 
     // get entry point of loaded library
     if Module.Headers.OptionalHeader.AddressOfEntryPoint <> 0 then
-    begin
-      @DllEntry := Pointer(PByte(code) + Module.Headers.OptionalHeader.AddressOfEntryPoint);
-      // notify library about attaching to process
-      successfull := DllEntry(HINST(code), DLL_PROCESS_ATTACH, nil);
-      if not successfull then
+      if Module.IsDLL then
       begin
-        SetLastError(ERROR_DLL_INIT_FAILED);
-        Abort;
-      end;
-      Module.Initialized := True;
-    end;
+        @DllEntry := Pointer(PByte(Code) + Module.Headers.OptionalHeader.AddressOfEntryPoint);
+        // notify library about attaching to process
+        Successfull := DllEntry(HINST(Code), DLL_PROCESS_ATTACH, nil);
+        if not Successfull then
+        begin
+          SetLastError(ERROR_DLL_INIT_FAILED);
+          Abort;
+        end;
+        Module.Initialized := True;
+      end
+      else
+        @Module.ExeEntry := Pointer(PByte(Code) + Module.Headers.OptionalHeader.AddressOfEntryPoint)
+    else
+      @Module.ExeEntry := nil;
 
     Result := Module;
   except
@@ -728,104 +1011,165 @@ begin
   end;
 end;
 
-function MemoryGetProcAddress(Module: TMemoryModule; const Name: PAnsiChar): Pointer; stdcall;
+function MemoryGetProcAddress(Modul: HMEMORYMODULE; Name: LPCSTR): FARPROC;
 var
   CodeBase: Pointer;
-  Idx: Integer;
+  Idx: DWORD;
   i: DWORD;
-  nameRef: PDWORD;
-  ordinal: PWord;
-  exportDir: PIMAGE_EXPORT_DIRECTORY;
-  directory: PIMAGE_DATA_DIRECTORY;
-  temp: PDWORD;
-  mmodule: PMemoryModule;
+  NameRef: PDWORD;
+  Ordinal: PWord;
+  ExportDir: PIMAGE_EXPORT_DIRECTORY;
+  Directory: PIMAGE_DATA_DIRECTORY;
+  Temp: PDWORD;
+  Module: PMEMORYMODULE;
+  Found, Entry: PExportNameEntry;
 begin
   Result := nil;
-  mmodule := PMemoryModule(Module);
-
-  CodeBase := mmodule.CodeBase;
-  directory := GET_HEADER_DICTIONARY(mmodule, IMAGE_DIRECTORY_ENTRY_EXPORT);
+  Module := PMEMORYMODULE(Modul);
+  CodeBase := Module.CodeBase;
+  Idx := 0;
+  Directory := GET_HEADER_DICTIONARY(Module, IMAGE_DIRECTORY_ENTRY_EXPORT);
   // no export table found
-  if directory.Size = 0 then
+  if Directory.Size = 0 then
   begin
     SetLastError(ERROR_PROC_NOT_FOUND);
     Exit;
   end;
 
-  exportDir := PIMAGE_EXPORT_DIRECTORY(PByte(CodeBase) + directory.VirtualAddress);
+  ExportDir := PIMAGE_EXPORT_DIRECTORY(PByte(CodeBase) + Directory.VirtualAddress);
   // DLL doesn't export anything
-  if (exportDir.NumberOfNames = 0) or (exportDir.NumberOfFunctions = 0) then
+  if (ExportDir.NumberOfNames = 0) or (ExportDir.NumberOfFunctions = 0) then
   begin
     SetLastError(ERROR_PROC_NOT_FOUND);
     Exit;
   end;
 
-  // search function name in list of exported names
-  nameRef := Pointer(PByte(CodeBase) + exportDir.AddressOfNames);
-  ordinal := Pointer(PByte(CodeBase) + exportDir.AddressOfNameOrdinals);
-  Idx := -1;
-  for i := 0 to exportDir.NumberOfNames - 1 do
+  // load function by ordinal value
+  if HiWord(UIntPtr(Name)) = 0 then
   begin
-    if StrComp(Name, PAnsiChar(PByte(CodeBase) + nameRef^)) = 0 then
+    if LoWord(UIntPtr(Name)) < ExportDir.Base then
     begin
-      Idx := ordinal^;
-      Break;
+      SetLastError(ERROR_PROC_NOT_FOUND);
+      Exit;
     end;
-    Inc(nameRef);
-    Inc(ordinal);
+    Idx := LoWord(UIntPtr(Name)) - ExportDir.Base;
+  end
+  else if ExportDir.NumberOfNames = 0 then
+  begin
+    SetLastError(ERROR_PROC_NOT_FOUND);
+    Exit;
+  end
+  else
+  begin
+    // Lazily build name table and sort it by names
+    if Module.NameExportsTable = nil then
+    begin
+      NameRef := Pointer(PByte(CodeBase) + ExportDir.AddressOfNames);
+      Ordinal := Pointer(PByte(CodeBase) + ExportDir.AddressOfNameOrdinals);
+      Entry := AllocMem(ExportDir.NumberOfNames*SizeOf(TExportNameEntry));
+      Module.NameExportsTable := Entry;
+      if Entry = nil then
+      begin
+        SetLastError(ERROR_OUTOFMEMORY);
+        Exit;
+      end;
+
+      for i := 1 to ExportDir.NumberOfNames do
+      begin
+        Entry.Name := LPCSTR(PByte(CodeBase) + NameRef^); {}//
+        Entry.Idx := Ordinal^;
+        Inc(NameRef);
+        Inc(Ordinal);
+        Inc(Entry);
+      end;
+      {}//TODO: sort
+    end;
+    // search function name in list of exported names with binary search
+    Found := nil; Entry := Module.NameExportsTable;
+    for i := 1 to ExportDir.NumberOfNames do
+    begin
+      {}//TODO: binary search
+      if StrComp(Name, Entry.Name) = 0 then
+      begin
+        Found := Entry;
+        Break;
+      end;
+      Inc(Entry);
+    end;
+    
+    if Found = nil then
+    begin
+      // exported symbol not found
+      SetLastError(ERROR_PROC_NOT_FOUND);
+      Exit;      
+    end;
+
+    Idx := Found.Idx;
   end;
 
-  // exported symbol not found
-  if (Idx = -1) then
+  // name <-> Ordinal number don't match
+  if (Idx > ExportDir.NumberOfFunctions) then
   begin
     SetLastError(ERROR_PROC_NOT_FOUND);
     Exit;
   end;
 
-  // name <-> ordinal number don't match
-  if (DWORD(Idx) > exportDir.NumberOfFunctions) then
-  begin
-    SetLastError(ERROR_PROC_NOT_FOUND);
-    Exit;
-  end;
+  // AddressOfFunctions contains the RVAs to the "real" functions   
+//      return (FARPROC)(LPVOID)(codeBase + (*(DWORD *) (Temp)));
 
-  // AddressOfFunctions contains the RVAs to the "real" functions     {}
-  temp := Pointer(PByte(CodeBase) + exportDir.AddressOfFunctions + Idx*4);
-  Result := Pointer(PByte(CodeBase) + temp^);
+  Temp := Pointer(PByte(CodeBase) + ExportDir.AddressOfFunctions + Idx*4); {}
+  Result := Pointer(PByte(CodeBase) + Temp^);
 end;
 
-procedure MemoryFreeLibrary(Module: TMemoryModule); stdcall;
+procedure MemoryFreeLibrary(Modul: HMEMORYMODULE);
 var
   i: Integer;
   DllEntry: TDllEntryProc;
-  mmodule: PMemoryModule;
+  Module: PMEMORYMODULE;
 begin
-  if Module = nil then Exit;
+  if Modul = nil then Exit;
 
-  mmodule := PMemoryModule(Module);
+  Module := PMEMORYMODULE(Modul);
 
-  if mmodule.Initialized then
+  if Module.Initialized then
   begin
     // notify library about detaching from process
-    @DllEntry := Pointer(PByte(mmodule.CodeBase) + mmodule.Headers.OptionalHeader.AddressOfEntryPoint);
-    DllEntry(HINST(mmodule.CodeBase), DLL_PROCESS_DETACH, nil);
+    @DllEntry := Pointer(PByte(Module.CodeBase) + Module.Headers.OptionalHeader.AddressOfEntryPoint);
+    DllEntry(HINST(Module.CodeBase), DLL_PROCESS_DETACH, nil);
   end;
 
-  if Length(mmodule.Modules) <> 0 then
+  Dispose(Module.NameExportsTable);
+
+  if Length(Module.Modules) <> 0 then
   begin
     // free previously opened libraries
-    for i := 0 to mmodule.NumModules - 1 do
-      if mmodule.Modules[i] <> 0 then
-        FreeLibrary_Internal(mmodule.Modules[i]);
-
-    SetLength(mmodule.Modules, 0);
+    for i := 0 to Module.NumModules - 1 do
+      if Module.Modules[i] <> nil then
+        Module.FreeLibrary(Module.Modules[i], Module.UserData);
+    SetLength(Module.Modules, 0);
   end;
 
-  if mmodule.CodeBase <> nil then
+  if Module.CodeBase <> nil then
     // release memory of library
-    VirtualFree(mmodule.CodeBase, 0, MEM_RELEASE);
+    Module.Free(Module.CodeBase, 0, MEM_RELEASE, Module.UserData);
 
-  HeapFree(GetProcessHeap(), 0, mmodule);
+  {$IFDEF CPU64}
+    FreePointerList(Module.BlockedMemory, Module.Free, Module.UserData);
+  {$ELSE}  
+    HeapFree(GetProcessHeap, 0, Module);
+  {$ENDIF}
+end;
+
+function MemoryCallEntryPoint(Modul: HMEMORYMODULE): Integer;
+var
+  Module: PMEMORYMODULE;
+begin
+  Module := PMEMORYMODULE(Modul);
+
+  if (Module = nil) or Module.IsDLL or (@Module.ExeEntry = nil) or not Module.IsRelocated then
+    Exit(-1);
+
+  Result := Module.ExeEntry();
 end;
 
 end.
