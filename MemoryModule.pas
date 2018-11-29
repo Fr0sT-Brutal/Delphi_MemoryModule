@@ -30,7 +30,7 @@ unit MemoryModule;
   *
   * ================== MemoryModule "Conversion to Delphi" ==================
   *
-  * Copyright (c) 2015 by Fr0sT / https://github.com/Fr0sT-Brutal
+  * Copyright (c) 2018 by Fr0sT / https://github.com/Fr0sT-Brutal
   *
   * Initially based on the code by:
   *   Copyright (c) 2005 - 2006 by Martin Offenwanger / coder@dsplayer.de / http://www.dsplayer.de
@@ -38,7 +38,7 @@ unit MemoryModule;
   *
   * NOTE
   *   This code is Delphi translation of original C code taken from https://github.com/fancycode/MemoryModule
-  *     (commit dc173ca from Mar 1, 2015).
+  *     (commit c8dae9 from May 18, 2018).
   *   Resource loading and exe loading, custom functions not implemented yet.
   *   Tested under RAD Studio XE2 and XE6 32/64-bit, Lazarus 32-bit
   * }
