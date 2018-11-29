@@ -4,24 +4,25 @@ program Project2;
 
 uses
   SysUtils, Classes, Windows,
-  MemoryModule in '..\MemoryModule.pas',
+  MemoryModule in '..\MemoryModule.pas'{,
   FuncHook in '..\FuncHook.pas',
-  MemoryModuleHook in '..\MemoryModuleHook.pas';
+  MemoryModuleHook in '..\MemoryModuleHook.pas'};
 
 const
   SUsage =
     'Test project for loading DLL from memory'+sLineBreak+
     'Params:'+sLineBreak+
     '  [DLL name] (required) - full path to DLL to load'+sLineBreak+
-    '  [Function name] (optional) - function to execute (no parameters, result is DWORD/Handle/Pointer)'+sLineBreak+
-    'Good testing sample is <%WinDir%\System32\KernelBase.dll> and <GetCurrentThread>';
+    '  [Function name] (optional) - function to execute (no parameters, result is INT_PTR/Handle/Pointer)'+sLineBreak+
+    'Good testing sample is <%WinDir%\(System32|SysWOW64)\KernelBase.dll> and <GetCurrentThread>';
 type
-  TNativeUIntFunc = function: NativeUInt;
+  TTestResType = NativeUInt;
+  TTestFunc = function: TTestResType;
 var
   ms: TMemoryStream;
-  lib : TMemoryModule;
-  func: TNativeUIntFunc;
-  res: array[0..2] of NativeUInt;
+  lib : HMEMORYMODULE;
+  func: TTestFunc;
+  res: array[0..2] of TTestResType;
   i: Integer;
 
 function GetLibPtrProc(lpLibFileName: PWideChar): Pointer;
@@ -42,7 +43,7 @@ begin
   Exit(True);
 end;
 
-function CheckLoadAndExecFunc(func: TNativeUIntFunc; out res: NativeUInt): Boolean;
+function CheckLoadAndExecFunc(func: TTestFunc; out res: TTestResType): Boolean;
 begin
   if @func = nil then
   begin
@@ -55,7 +56,7 @@ begin
 end;
 
 begin
-  try
+  try try
     if ParamCount = 0 then
     begin
       Writeln(SUsage);
@@ -70,7 +71,7 @@ begin
 
       if ParamStr(2) <> '' then
       begin
-        func := TNativeUIntFunc(GetProcAddress(HMODULE(lib), PAnsiChar(AnsiString(ParamStr(2)))));
+        func := TTestFunc(GetProcAddress(HMODULE(lib), PAnsiChar(AnsiString(ParamStr(2)))));
         if not CheckLoadAndExecFunc(func, res[0]) then Exit;
       end;
     finally
@@ -83,19 +84,21 @@ begin
       ms := TMemoryStream.Create;
       ms.LoadFromFile(ParamStr(1));
       ms.Position := 0;
-      lib := MemoryLoadLibary(ms.Memory);
+      lib := MemoryLoadLibary(ms.Memory, ms.Size);
       ms.Free;
       if not CheckLoadLib(lib) then Exit;
 
       if ParamStr(2) <> '' then
       begin
-        func := TNativeUIntFunc(MemoryGetProcAddress(lib, PAnsiChar(AnsiString(ParamStr(2)))));
+        func := TTestFunc(MemoryGetProcAddress(lib, PAnsiChar(AnsiString(ParamStr(2)))));
         if not CheckLoadAndExecFunc(func, res[1]) then Exit;
       end;
     finally
       MemoryFreeLibrary(lib);
     end;
 
+// TODO
+{
     Writeln('===== Test #2, load with hooking =====');
 
     if not InstallHook(@GetLibPtrProc) then
@@ -116,7 +119,7 @@ begin
 
       if ParamStr(2) <> '' then
       begin
-        func := TNativeUIntFunc(GetProcAddress(HMODULE(lib), PAnsiChar(AnsiString(ParamStr(2)))));
+        func := TTestFunc(GetProcAddress(HMODULE(lib), PAnsiChar(AnsiString(ParamStr(2)))));
         if not CheckLoadAndExecFunc(func, res[2]) then Exit;
       end;
     finally
@@ -135,9 +138,11 @@ begin
         end;
       Writeln('Success! Results identical')
     end;
-
+}
   except on E: Exception do
     Writeln('Error: '+E.Message);
   end;
-  Readln;
+  finally
+    Readln;
+  end;
 end.
