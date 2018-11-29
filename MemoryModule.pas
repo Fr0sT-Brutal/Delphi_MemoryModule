@@ -559,6 +559,8 @@ var
   // The case seem to happen with DLLs only and they rarely use Tls callbacks.
   // Moreover, they probably don't work at all when using DLL dynamically which is
   // the case in our code.
+  //https://github.com/fancycode/MemoryModule/issues/31
+  //https://github.com/DarthTon/Blackbone/blob/master/src/BlackBone/PE/PEImage.cpp  PEImage::GetTLSCallbacks
   {}function FixPtr(OldPtr: Pointer): Pointer;
   begin
     Result := OldPtr;  //Pointer(NativeInt(OldPtr) - Module.Headers.OptionalHeader.ImageBase + NativeInt(CodeBase));
@@ -1076,7 +1078,7 @@ begin
 
       for i := 1 to ExportDir.NumberOfNames do
       begin
-        Entry.Name := LPCSTR(PByte(CodeBase) + NameRef^); {}//
+        Entry.Name := LPCSTR(PByte(CodeBase) + NameRef^);
         Entry.Idx := Ordinal^;
         Inc(NameRef);
         Inc(Ordinal);
@@ -1115,9 +1117,7 @@ begin
   end;
 
   // AddressOfFunctions contains the RVAs to the "real" functions   
-//      return (FARPROC)(LPVOID)(codeBase + (*(DWORD *) (Temp)));
-
-  Temp := Pointer(PByte(CodeBase) + ExportDir.AddressOfFunctions + Idx*4); {}
+  Temp := Pointer(PByte(CodeBase) + ExportDir.AddressOfFunctions + Idx*4);
   Result := Pointer(PByte(CodeBase) + Temp^);
 end;
 
