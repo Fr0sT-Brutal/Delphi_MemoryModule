@@ -63,7 +63,7 @@ begin
     Exit;
   end;
 
-  Result := HMODULE(MemoryLoadLibary(LibPtr));
+  Result := HMODULE(MemoryLoadLibary(LibPtr, {}0));
   if Result <> 0 then
   try
     EnterCriticalSection(CS);
@@ -78,7 +78,7 @@ end;
 function GetProcAddressHook(hModule: HMODULE; lpProcName: LPCSTR): FARPROC; stdcall;
 begin
   if IndexOfLoadedModule(hModule) <> -1 then
-    Result := FARPROC(MemoryGetProcAddress(TMemoryModule(hModule), lpProcName))
+    Result := FARPROC(MemoryGetProcAddress(HMEMORYMODULE(hModule), lpProcName))
   else
     Result := GetProcAddress_Old(hModule, lpProcName);
 end;
@@ -90,7 +90,7 @@ begin
   idx := IndexOfLoadedModule(hLibModule);
   if idx <> -1 then
   begin
-    MemoryFreeLibrary(TMemoryModule(hLibModule));
+    MemoryFreeLibrary(HMEMORYMODULE(hLibModule));
     Result := BOOL(True);
     // Remove from the list
     try
