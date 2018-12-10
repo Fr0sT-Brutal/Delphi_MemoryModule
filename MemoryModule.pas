@@ -145,7 +145,7 @@ type
   TMemoryModuleRec = record
     Headers: PIMAGE_NT_HEADERS;
     CodeBase: Pointer;
-    Modules: array of HCUSTOMMODULE;
+    Modules: array of HMODULE;
     NumModules: Integer;
     Initialized: Boolean;
     IsRelocated: Boolean;
