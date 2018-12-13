@@ -222,7 +222,7 @@ begin
   Result := PIMAGE_DATA_DIRECTORY(@(Module.Headers.OptionalHeader.DataDirectory[Idx]));
 end;
 
-function AlignValueDown(Address: Pointer; Alignment: DWORD): Pointer;
+function ALIGN_DOWN(Address: Pointer; Alignment: DWORD): Pointer;
 begin
   Result := Pointer(UIntPtr(Address) and not (Alignment - 1));
 end;
