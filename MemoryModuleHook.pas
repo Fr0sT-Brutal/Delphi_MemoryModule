@@ -58,10 +58,7 @@ begin
 
   LibPtr := GetLibPtrCallback(lpLibFileName);
   if LibPtr = nil then
-  begin
-    LoadLibrary_Old(lpLibFileName);
-    Exit;
-  end;
+    Exit(LoadLibrary_Old(lpLibFileName));
 
   Result := HMODULE(MemoryLoadLibary(LibPtr));
   if Result <> 0 then

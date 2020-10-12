@@ -437,7 +437,7 @@ begin
   callback := Pointer(tls.AddressOfCallBacks);
   if callback <> nil then
   begin
-    callback := FixPtr(callback);
+//    callback := FixPtr(callback);
     while callback^ <> nil do
     begin
       PIMAGE_TLS_CALLBACK(FixPtr(callback^))(CodeBase, DLL_PROCESS_ATTACH, nil);
